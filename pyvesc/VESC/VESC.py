@@ -97,7 +97,9 @@ class VESC(object):
         if num_read_bytes is not None:
             while self.serial_port.in_waiting <= num_read_bytes:
                 time.sleep(0.000001)  # add some delay just to help the CPU
+            time.sleep(0.01)  # let the rest of the packet arrive before reading
             response, consumed = decode(self.serial_port.read(self.serial_port.in_waiting))
+            self.serial_port.reset_input_buffer()  # flush any unprocessed leftover bytes
             return response
 
     def set_rpm(self, new_rpm, **kwargs):
