@@ -66,6 +66,26 @@ class GetValues(metaclass=VESCMessage):
     ]
 
 
+class GetFwInfo(metaclass=VESCMessage):
+    """ Requests Zerno/VESC firmware info including commit hashes.
+
+    Response payload (parsed manually — two null-terminated strings not
+    supported by VESCMessage fields):
+        fw_version_major      : uint8
+        fw_version_minor      : uint8
+        fw_test_version_number: uint8
+        git_commit_hash       : null-terminated string (max 46 bytes)
+        user_git_commit_hash  : null-terminated string (max 46 bytes)
+    """
+    id = VedderCmd.COMM_FW_INFO
+
+    fields = [
+        ('fw_version_major',       'b', 0),
+        ('fw_version_minor',       'b', 0),
+        ('fw_test_version_number', 'b', 0),
+    ]
+
+
 class GetRotorPosition(metaclass=VESCMessage):
     """ Gets rotor position data
     

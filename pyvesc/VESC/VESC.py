@@ -1,4 +1,5 @@
 from pyvesc.protocol.interface import encode_request, encode, decode
+from pyvesc.protocol.packet.codec import unframe
 from pyvesc.VESC.messages import *
 import time
 import threading
@@ -136,6 +137,40 @@ class VESC(object):
     def get_firmware_version(self):
         msg = GetVersion()
         return str(self.write(encode_request(msg), num_read_bytes=msg._full_msg_size))
+
+    def get_fw_info(self):
+        """Request COMM_FW_INFO and return (fw_major, fw_minor, fw_test, git_hash, user_git_hash).
+
+        Parses the response manually because it contains two null-terminated
+        strings which VESCMessage fields do not support simultaneously.
+        Returns None if the response cannot be parsed.
+        """
+        self.serial_port.reset_input_buffer()
+        self.serial_port.write(encode_request(GetFwInfo))
+        time.sleep(0.1)
+        raw = self.serial_port.read(self.serial_port.in_waiting)
+        self.serial_port.reset_input_buffer()
+
+        payload, _ = unframe(raw)
+        if payload is None or len(payload) < 5:
+            return None
+
+        # payload[0] = COMM_FW_INFO (cmd id)
+        # payload[1..3] = fw_major, fw_minor, fw_test_version
+        # payload[4..] = GIT_COMMIT_HASH\0 USER_GIT_COMMIT_HASH\0
+        fw_major = payload[1]
+        fw_minor  = payload[2]
+        fw_test   = payload[3]
+        rest = bytes(payload[4:])
+
+        null1 = rest.find(b'\x00')
+        git_hash = rest[:null1].decode('ascii', errors='replace') if null1 >= 0 else rest.decode('ascii', errors='replace')
+
+        rest2 = rest[null1 + 1:] if null1 >= 0 else b''
+        null2 = rest2.find(b'\x00')
+        user_git_hash = rest2[:null2].decode('ascii', errors='replace') if null2 >= 0 else rest2.decode('ascii', errors='replace')
+
+        return fw_major, fw_minor, fw_test, git_hash, user_git_hash
 
     def get_rpm(self):
         """

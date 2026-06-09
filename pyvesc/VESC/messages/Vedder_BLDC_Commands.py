@@ -92,3 +92,4 @@ class VedderCmd(IntEnum):
     COMM_SET_BLE_NAME = 87
     COMM_SET_BLE_PIN = 88
     COMM_SET_CAN_MODE = 89
+    COMM_FW_INFO = 157
