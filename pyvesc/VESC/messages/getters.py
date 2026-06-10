@@ -62,8 +62,16 @@ class GetValues(metaclass=VESCMessage):
         ('mc_fault_code', 'c', 0),
         ('pid_pos_now', 'i', 1000000),
         ('app_controller_id', 'c', 0),
-        ('time_ms', 'i', 1),
+        ('temp_mos1', 'h', 10),
+        ('temp_mos2', 'h', 10),
+        ('temp_mos3', 'h', 10),
     ]
+
+
+class Print(metaclass=VESCMessage):
+    """VESC terminal output — response to COMM_TERMINAL_CMD."""
+    id = VedderCmd.COMM_PRINT
+    fields = [('message', 's')]
 
 
 class GetFwInfo(metaclass=VESCMessage):

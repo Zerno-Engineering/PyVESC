@@ -43,7 +43,10 @@ class VESCMessage(type):
                 cls._fmt_fields += '%u'
                 cls._string_field = idx
             cls._fmt_fields += field[1]
-        cls._full_msg_size = struct.calcsize(cls._fmt_fields)
+        if cls._string_field is None:
+            cls._full_msg_size = struct.calcsize(cls._fmt_fields)
+        else:
+            cls._full_msg_size = 0  # variable length — cannot compute at class definition time
         # check that at most 1 field is a string
         string_field_count = cls._fmt_fields.count('s')
         if string_field_count > 1:

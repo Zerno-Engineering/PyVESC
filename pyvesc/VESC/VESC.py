@@ -138,6 +138,22 @@ class VESC(object):
         msg = GetVersion()
         return str(self.write(encode_request(msg), num_read_bytes=msg._full_msg_size))
 
+    def send_terminal_cmd(self, cmd):
+        """Send a terminal command string and return the first COMM_PRINT response.
+
+        :param cmd: Command string (e.g. "foc_openloop 0.3 300")
+        :return: Response text string, or None if no response received.
+        """
+        self.serial_port.reset_input_buffer()
+        self.serial_port.write(encode(TerminalCmd(cmd)))
+        time.sleep(0.1)
+        raw = self.serial_port.read(self.serial_port.in_waiting)
+        self.serial_port.reset_input_buffer()
+        response, _ = decode(raw)
+        if response is not None and hasattr(response, 'message'):
+            return response.message
+        return None
+
     def get_fw_info(self):
         """Request COMM_FW_INFO and return (fw_major, fw_minor, fw_test, git_hash, user_git_hash).
 

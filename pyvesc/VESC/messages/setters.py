@@ -98,3 +98,13 @@ class Alive(metaclass=VESCMessage):
     id = VedderCmd.COMM_ALIVE
     fields = []
 
+
+class TerminalCmd(metaclass=VESCMessage):
+    """Send a string command to the VESC terminal interface.
+
+    The VESC processes the command and responds with one or more COMM_PRINT
+    messages containing the output text.
+    """
+    id = VedderCmd.COMM_TERMINAL_CMD
+    fields = [('command', 's')]
+
