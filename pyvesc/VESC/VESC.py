@@ -188,6 +188,74 @@ class VESC(object):
 
         return fw_major, fw_minor, fw_test, git_hash, user_git_hash
 
+    def detect_motor_rl(self, timeout=30.0):
+        """Send COMM_DETECT_MOTOR_R_L and return (r_ohm, l_henry, ld_lq_diff_henry).
+
+        Blocks in the VESC firmware for several seconds while it applies current
+        to measure resistance and inductance. Returns (0.0, 0.0, 0.0) when the
+        VESC reports a fault (e.g. no motor connected).
+        """
+        from pyvesc.protocol.packet.codec import frame, unframe
+        import struct
+        _CMD = 25  # COMM_DETECT_MOTOR_R_L
+        self.serial_port.reset_input_buffer()
+        self.serial_port.write(frame(bytes([_CMD])))
+        buf = b''
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            time.sleep(0.1)
+            if self.serial_port.in_waiting:
+                buf += self.serial_port.read(self.serial_port.in_waiting)
+            payload, consumed = unframe(buf)
+            buf = buf[consumed:]
+            if payload and len(payload) >= 13 and payload[0] == _CMD:
+                r, l, ld_lq_diff = struct.unpack_from('!iii', payload, 1)
+                return r / 1e6, l / 1e3, ld_lq_diff / 1e3
+        raise TimeoutError(f"No response to COMM_DETECT_MOTOR_R_L after {timeout:.0f}s")
+
+    def detect_motor_flux_linkage_openloop(self, current, erpm_per_sec, duty,
+                                           resistance, inductance, timeout=60.0):
+        """Send COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP and return
+        (linkage_wb, enc_offset, enc_ratio, enc_inverted).
+
+        Spins the motor open-loop to measure flux linkage. Returns (0.0, ...)
+        when the VESC reports a fault.
+
+        Request field order (from commands.c):
+            current [A]       × 1e3
+            erpm_per_sec      × 1e3
+            duty [0.0–1.0]    × 1e3
+            resistance [Ω]    × 1e6
+            inductance [H]    × 1e8  (optional field — always sent)
+        """
+        from pyvesc.protocol.packet.codec import frame, unframe
+        import struct
+        _CMD = 57  # COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP
+        params = struct.pack('!iiiii',
+            int(current      * 1e3),
+            int(erpm_per_sec * 1e3),
+            int(duty         * 1e3),
+            int(resistance   * 1e6),
+            int(inductance   * 1e8),
+        )
+        self.serial_port.reset_input_buffer()
+        self.serial_port.write(frame(bytes([_CMD]) + params))
+        buf = b''
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            time.sleep(0.1)
+            if self.serial_port.in_waiting:
+                buf += self.serial_port.read(self.serial_port.in_waiting)
+            payload, consumed = unframe(buf)
+            buf = buf[consumed:]
+            if payload and len(payload) >= 14 and payload[0] == _CMD:
+                linkage, enc_offset, enc_ratio = struct.unpack_from('!iii', payload, 1)
+                enc_inverted = bool(payload[13])
+                return linkage / 1e7, enc_offset / 1e6, enc_ratio / 1e6, enc_inverted
+        raise TimeoutError(
+            f"No response to COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP after {timeout:.0f}s"
+        )
+
     def get_rpm(self):
         """
         :return: Current motor rpm
