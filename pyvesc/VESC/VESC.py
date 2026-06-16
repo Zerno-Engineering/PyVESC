@@ -338,6 +338,42 @@ class VESC(object):
                 )
         raise TimeoutError(f"No response to COMM_GET_MCCONF_DEFAULT after {timeout:.0f}s")
 
+    def set_rotor_position_mode(self, mode):
+        """Set the firmware's periodic-thread position-report mode (COMM_SET_DETECT).
+
+        Use SetRotorPositionMode.DISP_POS_MODE_ENCODER to make the firmware
+        broadcast raw encoder angle via unsolicited COMM_ROTOR_POSITION packets
+        every 10ms. Use SetRotorPositionMode.DISP_POS_OFF to stop the broadcast.
+        """
+        self.write(encode(SetRotorPositionMode(mode)))
+
+    def stream_rotor_positions(self, max_duration_s, poll_interval_s=0.05):
+        """Yield (timestamp, angle_deg) for each COMM_ROTOR_POSITION packet
+        received, for up to max_duration_s seconds.
+
+        Requires set_rotor_position_mode(DISP_POS_MODE_ENCODER) to have been
+        called first; the caller is responsible for turning it back off
+        afterward. Draining happens every poll_interval_s, but since the
+        firmware broadcasts every 10ms regardless, multiple buffered packets
+        may be decoded per drain — no samples are skipped.
+        """
+        import struct
+        _CMD = 22  # COMM_ROTOR_POSITION
+        buf = b''
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < max_duration_s:
+            time.sleep(poll_interval_s)
+            if self.serial_port.in_waiting:
+                buf += self.serial_port.read(self.serial_port.in_waiting)
+            while True:
+                payload, consumed = unframe(buf)
+                if consumed == 0:
+                    break
+                buf = buf[consumed:]
+                if payload and len(payload) >= 5 and payload[0] == _CMD:
+                    angle = struct.unpack_from('!i', payload, 1)[0] / 100000.0
+                    yield time.monotonic(), angle
+
     def get_rpm(self):
         """
         :return: Current motor rpm
