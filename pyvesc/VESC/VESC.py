@@ -256,6 +256,36 @@ class VESC(object):
             f"No response to COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP after {timeout:.0f}s"
         )
 
+    def detect_encoder(self, current, timeout=30.0):
+        """Send COMM_DETECT_ENCODER and return (offset_deg, ratio, inverted).
+
+        Spins the motor briefly to find the angular offset between electrical
+        zero and encoder zero. Returns offset=1001.0 when the encoder is not
+        configured in the VESC firmware.
+
+        Request: current [A] × 1e3
+        Response: offset [deg] × 1e6, ratio × 1e6, inverted (u8)
+        """
+        from pyvesc.protocol.packet.codec import frame, unframe
+        import struct
+        _CMD = 27  # COMM_DETECT_ENCODER
+        params = struct.pack('!i', int(current * 1e3))
+        self.serial_port.reset_input_buffer()
+        self.serial_port.write(frame(bytes([_CMD]) + params))
+        buf = b''
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            time.sleep(0.1)
+            if self.serial_port.in_waiting:
+                buf += self.serial_port.read(self.serial_port.in_waiting)
+            payload, consumed = unframe(buf)
+            buf = buf[consumed:]
+            if payload and len(payload) >= 10 and payload[0] == _CMD:
+                offset, ratio = struct.unpack_from('!ii', payload, 1)
+                inverted = bool(payload[9])
+                return offset / 1e6, ratio / 1e6, inverted
+        raise TimeoutError(f"No response to COMM_DETECT_ENCODER after {timeout:.0f}s")
+
     def get_rpm(self):
         """
         :return: Current motor rpm
