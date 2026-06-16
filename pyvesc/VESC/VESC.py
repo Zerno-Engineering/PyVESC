@@ -1,6 +1,7 @@
 from pyvesc.protocol.interface import encode_request, encode, decode
 from pyvesc.protocol.packet.codec import unframe
 from pyvesc.VESC.messages import *
+import math
 import time
 import threading
 
@@ -9,6 +10,24 @@ try:
     import serial
 except ImportError:
     serial = None
+
+
+def _decode_float32_auto(raw_u32):
+    """Port of buffer_get_float32_auto() from the VESC firmware (util/buffer.c).
+
+    Not standard IEEE-754 — a custom sign/exponent/23-bit-mantissa packing
+    used by confgenerator.c for most mc_configuration float fields.
+    """
+    e = (raw_u32 >> 23) & 0xFF
+    sig_i = raw_u32 & 0x7FFFFF
+    neg = bool(raw_u32 & (1 << 31))
+    sig = 0.0
+    if e != 0 or sig_i != 0:
+        sig = sig_i / (8388608.0 * 2.0) + 0.5
+        e -= 126
+    if neg:
+        sig = -sig
+    return math.ldexp(sig, e)
 
 
 class VESC(object):
@@ -285,6 +304,39 @@ class VESC(object):
                 inverted = bool(payload[9])
                 return offset / 1e6, ratio / 1e6, inverted
         raise TimeoutError(f"No response to COMM_DETECT_ENCODER after {timeout:.0f}s")
+
+    def get_mcconf_default_motor_params(self, timeout=5.0):
+        """Send COMM_GET_MCCONF_DEFAULT and return (l_h, ld_lq_diff_h, r_ohm,
+        flux_linkage_wb) from the firmware's compiled-in lab-reference motor
+        configuration (mcconf_zerno_drive.h MCCONF_FOC_MOTOR_* constants).
+
+        Only the four foc_motor_* fields are decoded; the rest of the
+        ~150-field mc_configuration blob is skipped by byte width. Offsets
+        are fixed by the field order in confgenerator.c and don't depend on
+        field values, since every field type has a constant width.
+        """
+        from pyvesc.protocol.packet.codec import frame, unframe
+        import struct
+        _CMD = 15  # COMM_GET_MCCONF_DEFAULT
+        self.serial_port.reset_input_buffer()
+        self.serial_port.write(frame(bytes([_CMD])))
+        buf = b''
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            time.sleep(0.1)
+            if self.serial_port.in_waiting:
+                buf += self.serial_port.read(self.serial_port.in_waiting)
+            payload, consumed = unframe(buf)
+            buf = buf[consumed:]
+            if payload and len(payload) >= 174 and payload[0] == _CMD:
+                l_raw, ld_lq_raw, r_raw, flux_raw = struct.unpack_from('!IIII', payload, 158)
+                return (
+                    _decode_float32_auto(l_raw),
+                    _decode_float32_auto(ld_lq_raw),
+                    _decode_float32_auto(r_raw),
+                    _decode_float32_auto(flux_raw),
+                )
+        raise TimeoutError(f"No response to COMM_GET_MCCONF_DEFAULT after {timeout:.0f}s")
 
     def get_rpm(self):
         """
