@@ -207,6 +207,46 @@ class VESC(object):
 
         return fw_major, fw_minor, fw_test, git_hash, user_git_hash
 
+    def get_mcu_uuid(self):
+        """Extract the 12-byte STM32 UUID from a COMM_FW_VERSION response.
+
+        COMM_FW_VERSION payload layout:
+            [0]       cmd_id (COMM_FW_VERSION)
+            [1]       fw_major
+            [2]       fw_minor
+            [3..N]    hw_name (null-terminated)
+            [N+1..N+12] STM32 UUID (12 bytes)
+
+        Returns a 24-character uppercase hex string, or None if the response
+        cannot be parsed or UUID bytes are missing/all-zero.
+        """
+        msg = GetVersion()
+        self.serial_port.reset_input_buffer()
+        self.serial_port.write(encode_request(msg))
+        time.sleep(0.1)
+        raw = self.serial_port.read(self.serial_port.in_waiting)
+        self.serial_port.reset_input_buffer()
+
+        payload, _ = unframe(raw)
+        if payload is None or len(payload) < 4:
+            return None
+
+        hw_name_start = 3
+        rest = bytes(payload[hw_name_start:])
+        null_pos = rest.find(b'\x00')
+        if null_pos < 0:
+            return None
+
+        uuid_start = hw_name_start + null_pos + 1
+        if len(payload) < uuid_start + 12:
+            return None
+
+        uuid_bytes = bytes(payload[uuid_start:uuid_start + 12])
+        if uuid_bytes == b'\x00' * 12:
+            return None
+
+        return uuid_bytes.hex().upper()
+
     def detect_motor_rl(self, timeout=30.0):
         """Send COMM_DETECT_MOTOR_R_L and return (r_ohm, l_henry, ld_lq_diff_henry).
 
