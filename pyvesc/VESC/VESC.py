@@ -157,21 +157,50 @@ class VESC(object):
         msg = GetVersion()
         return str(self.write(encode_request(msg), num_read_bytes=msg._full_msg_size))
 
-    def send_terminal_cmd(self, cmd):
-        """Send a terminal command string and return the first COMM_PRINT response.
+    def send_terminal_cmd(self, cmd, timeout=1.0):
+        """Send a terminal command string and return all COMM_PRINT responses concatenated.
 
-        :param cmd: Command string (e.g. "foc_openloop 0.3 300")
+        :param cmd: Command string (e.g. "faults")
+        :param timeout: Maximum seconds to wait for the full response.
         :return: Response text string, or None if no response received.
         """
         self.serial_port.reset_input_buffer()
         self.serial_port.write(encode(TerminalCmd(cmd)))
-        time.sleep(0.1)
-        raw = self.serial_port.read(self.serial_port.in_waiting)
-        self.serial_port.reset_input_buffer()
-        response, _ = decode(raw)
-        if response is not None and hasattr(response, 'message'):
-            return response.message
-        return None
+
+        # Accumulate bytes until no new data arrives for two serial-timeout periods.
+        # Serial timeout is 0.05 s, so two consecutive empty reads = ~100 ms of silence.
+        accumulated = b''
+        deadline = time.time() + timeout
+        consecutive_empty = 0
+        while time.time() < deadline:
+            waiting = self.serial_port.in_waiting
+            if waiting > 0:
+                accumulated += self.serial_port.read(waiting)
+                consecutive_empty = 0
+            else:
+                chunk = self.serial_port.read(1)
+                if chunk:
+                    accumulated += chunk
+                    consecutive_empty = 0
+                else:
+                    consecutive_empty += 1
+                    if consecutive_empty >= 2 and accumulated:
+                        break
+
+        if not accumulated:
+            return None
+
+        messages = []
+        buf = accumulated
+        while buf:
+            response, consumed = decode(buf)
+            if consumed == 0:
+                break
+            buf = buf[consumed:]
+            if response is not None and hasattr(response, 'message'):
+                messages.append(response.message)
+
+        return ''.join(messages) if messages else None
 
     def get_fw_info(self):
         """Request COMM_FW_INFO and return (fw_major, fw_minor, fw_test, git_hash, user_git_hash).
