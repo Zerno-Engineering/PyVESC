@@ -407,6 +407,77 @@ class VESC(object):
                 )
         raise TimeoutError(f"No response to COMM_GET_MCCONF_DEFAULT after {timeout:.0f}s")
 
+    def erase_new_app(self, size, timeout=20.0):
+        """Send COMM_ERASE_NEW_APP and wait for the erase-complete response.
+
+        Erases the "new app" staging region (separate from the currently
+        running application) ahead of a USB firmware update. Erasing whole
+        flash sectors is slow — VESC Tool allows up to 20s for this.
+
+        :param size: number of bytes to erase in the staging region.
+        :return: True if the firmware reported success.
+        """
+        from pyvesc.protocol.packet.codec import frame, unframe
+        import struct
+        _CMD = 2  # COMM_ERASE_NEW_APP
+        self.serial_port.reset_input_buffer()
+        self.serial_port.write(frame(bytes([_CMD]) + struct.pack('!I', size)))
+        buf = b''
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            time.sleep(0.1)
+            if self.serial_port.in_waiting:
+                buf += self.serial_port.read(self.serial_port.in_waiting)
+            payload, consumed = unframe(buf)
+            buf = buf[consumed:]
+            if payload and len(payload) >= 2 and payload[0] == _CMD:
+                return bool(payload[1])
+        raise TimeoutError(f"No response to COMM_ERASE_NEW_APP after {timeout:.0f}s")
+
+    def write_new_app_data(self, offset, data, timeout=3.0):
+        """Send one COMM_WRITE_NEW_APP_DATA chunk and wait for its ack.
+
+        Writes into the "new app" staging region only — never touches the
+        currently running application, so this is safe to call even if a
+        later step (jump_to_bootloader) never happens.
+
+        :param offset: byte offset within the staging region.
+        :param data: raw chunk bytes. Keep chunks well under
+            PACKET_MAX_PL_LEN (512) minus 5 bytes of header; VESC Tool uses
+            384-byte chunks.
+        :return: True if the firmware reported success for this chunk.
+        """
+        from pyvesc.protocol.packet.codec import frame, unframe
+        import struct
+        _CMD = 3  # COMM_WRITE_NEW_APP_DATA
+        self.serial_port.reset_input_buffer()
+        self.serial_port.write(frame(bytes([_CMD]) + struct.pack('!I', offset) + bytes(data)))
+        buf = b''
+        t0 = time.monotonic()
+        while time.monotonic() - t0 < timeout:
+            time.sleep(0.01)
+            if self.serial_port.in_waiting:
+                buf += self.serial_port.read(self.serial_port.in_waiting)
+            payload, consumed = unframe(buf)
+            buf = buf[consumed:]
+            if payload and len(payload) >= 2 and payload[0] == _CMD:
+                return bool(payload[1])
+        raise TimeoutError(f"No response to COMM_WRITE_NEW_APP_DATA after {timeout:.0f}s")
+
+    def jump_to_bootloader(self):
+        """Send COMM_JUMP_TO_BOOTLOADER.
+
+        No response is expected: the device tears down its USB connection
+        and reboots into the bootloader immediately, which validates and
+        applies whatever was staged via erase_new_app()/write_new_app_data()
+        before booting the new application. This is the point of no return
+        in a firmware update — call only once every chunk has been
+        acknowledged successfully.
+        """
+        from pyvesc.protocol.packet.codec import frame
+        _CMD = 1  # COMM_JUMP_TO_BOOTLOADER
+        self.serial_port.write(frame(bytes([_CMD])))
+
     def set_rotor_position_mode(self, mode):
         """Set the firmware's periodic-thread position-report mode (COMM_SET_DETECT).
 
