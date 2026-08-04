@@ -81,8 +81,14 @@ class VESC(object):
         """
         while not self._stop_heartbeat.is_set():
             time.sleep(0.1)
-            for i in self.alive_msg:
-                self.write(i)
+            try:
+                for i in self.alive_msg:
+                    self.write(i)
+            except serial.SerialException:
+                # Device disappeared (e.g. USB unplugged). Nothing to retry —
+                # a fresh VESC instance gets its own heartbeat on reconnect,
+                # and the owning app's own polling detects the loss.
+                break
 
     def start_heartbeat(self, can_id=None):
         """
