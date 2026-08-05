@@ -88,12 +88,26 @@ class VESC(object):
         touching the port when it closes (pyserial raises different, racy
         exceptions from in_waiting()/read() depending on exactly when the
         underlying file descriptor disappears mid-call otherwise).
+
+        flush()/close() are each best-effort: if the device physically
+        disappeared before we get here (e.g. the USB cable was pulled while
+        connected, rather than a clean jump-to-bootloader reboot we
+        triggered ourselves), they can raise platform-specific errors that
+        aren't even OSError subclasses — flush()'s termios.tcdrain() raises
+        plain termios.error on POSIX. None of that is actionable since this
+        connection is being discarded either way.
         """
         self.stop_heartbeat()
         self._dispatcher.stop()
         if self.serial_port.is_open:
-            self.serial_port.flush()
-            self.serial_port.close()
+            try:
+                self.serial_port.flush()
+            except Exception:
+                pass
+            try:
+                self.serial_port.close()
+            except Exception:
+                pass
 
     def _heartbeat_cmd_func(self):
         """
