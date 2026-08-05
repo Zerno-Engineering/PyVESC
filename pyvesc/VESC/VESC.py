@@ -1,9 +1,13 @@
-from pyvesc.protocol.interface import encode_request, encode, decode
-from pyvesc.protocol.packet.codec import unframe
+from pyvesc.protocol.base import VESCMessage
+from pyvesc.protocol.interface import encode_request, encode
+from pyvesc.protocol.packet.codec import frame
 from pyvesc.VESC.messages import *
+from pyvesc.VESC.serial_dispatcher import SerialDispatcher
 import math
-import time
+import queue
+import struct
 import threading
+import time
 
 # because people may want to use this library for their own messaging, do not make this a required package
 try:
@@ -45,8 +49,16 @@ class VESC(object):
             raise ImportError("Need to install pyserial in order to use the VESCMotor class.")
 
         self.serial_port = serial.Serial(port=serial_port, baudrate=baudrate, timeout=timeout)
+
+        # Single owner of all reads, demultiplexing replies by comm-id so
+        # unrelated traffic (heartbeat, telemetry polling, test commands,
+        # unsolicited rotor-position broadcasts) can safely interleave on the
+        # same connection — see serial_dispatcher.py for why this replaces
+        # each method doing its own blocking read.
+        self._dispatcher = SerialDispatcher(self.serial_port)
+
         if has_sensor:
-            self.serial_port.write(encode(SetRotorPositionMode(SetRotorPositionMode.DISP_POS_OFF)))
+            self._dispatcher.send(encode(SetRotorPositionMode(SetRotorPositionMode.DISP_POS_OFF)))
 
         self.alive_msg = [encode(Alive())]
 
@@ -62,15 +74,23 @@ class VESC(object):
             GetValues.fields = pre_v3_33_fields
 
         # store message info for getting values so it doesn't need to calculate it every time
-        msg = GetValues()
-        self._get_values_msg = encode_request(msg)
-        self._get_values_msg_expected_length = msg._full_msg_size
+        self._get_values_msg = encode_request(GetValues())
 
     def __enter__(self):
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+
+    def close(self):
+        """Stop the heartbeat and the dispatcher's reader thread, then close
+        the serial port — in that order, so the reader thread is never still
+        touching the port when it closes (pyserial raises different, racy
+        exceptions from in_waiting()/read() depending on exactly when the
+        underlying file descriptor disappears mid-call otherwise).
+        """
         self.stop_heartbeat()
+        self._dispatcher.stop()
         if self.serial_port.is_open:
             self.serial_port.flush()
             self.serial_port.close()
@@ -83,8 +103,8 @@ class VESC(object):
             time.sleep(0.1)
             try:
                 for i in self.alive_msg:
-                    self.write(i)
-            except serial.SerialException:
+                    self._dispatcher.send(i)
+            except (OSError, serial.SerialException):
                 # Device disappeared (e.g. USB unplugged). Nothing to retry —
                 # a fresh VESC instance gets its own heartbeat on reconnect,
                 # and the owning app's own polling detects the loss.
@@ -111,57 +131,41 @@ class VESC(object):
         if self.heart_beat_thread.is_alive():
             self.heart_beat_thread.join()
 
-    def write(self, data, num_read_bytes=None):
-        """
-        A write wrapper function implemented like this to try and make it easier to incorporate other communication
-        methods than UART in the future.
-        :param data: the byte string to be sent
-        :param num_read_bytes: number of bytes to read for decoding response
-        :return: decoded response from buffer
-        """
-        self.serial_port.write(data)
-        if num_read_bytes is not None:
-            while self.serial_port.in_waiting <= num_read_bytes:
-                time.sleep(0.000001)  # add some delay just to help the CPU
-            time.sleep(0.01)  # let the rest of the packet arrive before reading
-            response, consumed = decode(self.serial_port.read(self.serial_port.in_waiting))
-            self.serial_port.reset_input_buffer()  # flush any unprocessed leftover bytes
-            return response
-
     def set_rpm(self, new_rpm, **kwargs):
         """
         Set the electronic RPM value (a.k.a. the RPM value of the stator)
         :param new_rpm: new rpm value
         """
-        self.write(encode(SetRPM(new_rpm, **kwargs)))
+        self._dispatcher.send(encode(SetRPM(new_rpm, **kwargs)))
 
     def set_current(self, new_current, **kwargs):
         """
         :param new_current: new current in milli-amps for the motor
         """
-        self.write(encode(SetCurrent(new_current, **kwargs)))
+        self._dispatcher.send(encode(SetCurrent(new_current, **kwargs)))
 
     def set_duty_cycle(self, new_duty_cycle, **kwargs):
         """
         :param new_duty_cycle: Value of duty cycle to be set (range [-1e5, 1e5]).
         """
-        self.write(encode(SetDutyCycle(new_duty_cycle, **kwargs)))
+        self._dispatcher.send(encode(SetDutyCycle(new_duty_cycle, **kwargs)))
 
     def set_servo(self, new_servo_pos, **kwargs):
         """
         :param new_servo_pos: New servo position. valid range [0, 1]
         """
-        self.write(encode(SetServoPosition(new_servo_pos, **kwargs)))
+        self._dispatcher.send(encode(SetServoPosition(new_servo_pos, **kwargs)))
 
-    def get_measurements(self):
+    def get_measurements(self, timeout=1.0):
         """
         :return: A msg object with attributes containing the measurement values
         """
-        return self.write(self._get_values_msg, num_read_bytes=self._get_values_msg_expected_length)
+        payload = self._dispatcher.request(self._get_values_msg, GetValues.id, timeout=timeout)
+        return VESCMessage.unpack(payload)
 
-    def get_firmware_version(self):
-        msg = GetVersion()
-        return str(self.write(encode_request(msg), num_read_bytes=msg._full_msg_size))
+    def get_firmware_version(self, timeout=2.0):
+        payload = self._dispatcher.request(encode_request(GetVersion()), GetVersion.id, timeout=timeout)
+        return str(VESCMessage.unpack(payload))
 
     def send_terminal_cmd(self, cmd, timeout=1.0):
         """Send a terminal command string and return all COMM_PRINT responses concatenated.
@@ -170,59 +174,51 @@ class VESC(object):
         :param timeout: Maximum seconds to wait for the full response.
         :return: Response text string, or None if no response received.
         """
-        self.serial_port.reset_input_buffer()
-        self.serial_port.write(encode(TerminalCmd(cmd)))
-
-        # Accumulate bytes until no new data arrives for two serial-timeout periods.
-        # Serial timeout is 0.05 s, so two consecutive empty reads = ~100 ms of silence.
-        accumulated = b''
-        deadline = time.time() + timeout
-        consecutive_empty = 0
-        while time.time() < deadline:
-            waiting = self.serial_port.in_waiting
-            if waiting > 0:
-                accumulated += self.serial_port.read(waiting)
-                consecutive_empty = 0
-            else:
-                chunk = self.serial_port.read(1)
-                if chunk:
-                    accumulated += chunk
-                    consecutive_empty = 0
-                else:
-                    consecutive_empty += 1
-                    if consecutive_empty >= 2 and accumulated:
-                        break
-
-        if not accumulated:
-            return None
-
         messages = []
-        buf = accumulated
-        while buf:
-            response, consumed = decode(buf)
-            if consumed == 0:
-                break
-            buf = buf[consumed:]
-            if response is not None and hasattr(response, 'message'):
-                messages.append(response.message)
+        state_lock = threading.Lock()
+        last_received_at = [time.monotonic()]
 
-        return ''.join(messages) if messages else None
+        def on_print(payload):
+            try:
+                msg = VESCMessage.unpack(payload)
+            except Exception:
+                return
+            with state_lock:
+                last_received_at[0] = time.monotonic()
+                if hasattr(msg, 'message'):
+                    messages.append(msg.message)
 
-    def get_fw_info(self):
+        unsubscribe = self._dispatcher.subscribe(Print.id, on_print)
+        try:
+            self._dispatcher.send(encode(TerminalCmd(cmd)))
+            deadline = time.monotonic() + timeout
+            # Accumulate until ~100ms of silence follows at least one message,
+            # since terminal output may arrive as several COMM_PRINT packets.
+            while time.monotonic() < deadline:
+                time.sleep(0.02)
+                with state_lock:
+                    have_messages = bool(messages)
+                    quiet_for = time.monotonic() - last_received_at[0]
+                if have_messages and quiet_for >= 0.1:
+                    break
+        finally:
+            unsubscribe()
+
+        with state_lock:
+            return ''.join(messages) if messages else None
+
+    def get_fw_info(self, timeout=2.0):
         """Request COMM_FW_INFO and return (fw_major, fw_minor, fw_test, git_hash, user_git_hash).
 
         Parses the response manually because it contains two null-terminated
         strings which VESCMessage fields do not support simultaneously.
-        Returns None if the response cannot be parsed.
+        Returns None if the response cannot be parsed or times out.
         """
-        self.serial_port.reset_input_buffer()
-        self.serial_port.write(encode_request(GetFwInfo))
-        time.sleep(0.1)
-        raw = self.serial_port.read(self.serial_port.in_waiting)
-        self.serial_port.reset_input_buffer()
-
-        payload, _ = unframe(raw)
-        if payload is None or len(payload) < 5:
+        try:
+            payload = self._dispatcher.request(encode_request(GetFwInfo), GetFwInfo.id, timeout=timeout)
+        except TimeoutError:
+            return None
+        if len(payload) < 5:
             return None
 
         # payload[0] = COMM_FW_INFO (cmd id)
@@ -242,7 +238,7 @@ class VESC(object):
 
         return fw_major, fw_minor, fw_test, git_hash, user_git_hash
 
-    def get_mcu_uuid(self):
+    def get_mcu_uuid(self, timeout=2.0):
         """Extract the 12-byte STM32 UUID from a COMM_FW_VERSION response.
 
         COMM_FW_VERSION payload layout:
@@ -253,17 +249,13 @@ class VESC(object):
             [N+1..N+12] STM32 UUID (12 bytes)
 
         Returns a 24-character uppercase hex string, or None if the response
-        cannot be parsed or UUID bytes are missing/all-zero.
+        cannot be parsed, times out, or UUID bytes are missing/all-zero.
         """
-        msg = GetVersion()
-        self.serial_port.reset_input_buffer()
-        self.serial_port.write(encode_request(msg))
-        time.sleep(0.1)
-        raw = self.serial_port.read(self.serial_port.in_waiting)
-        self.serial_port.reset_input_buffer()
-
-        payload, _ = unframe(raw)
-        if payload is None or len(payload) < 4:
+        try:
+            payload = self._dispatcher.request(encode_request(GetVersion()), GetVersion.id, timeout=timeout)
+        except TimeoutError:
+            return None
+        if len(payload) < 4:
             return None
 
         hw_name_start = 3
@@ -289,23 +281,12 @@ class VESC(object):
         to measure resistance and inductance. Returns (0.0, 0.0, 0.0) when the
         VESC reports a fault (e.g. no motor connected).
         """
-        from pyvesc.protocol.packet.codec import frame, unframe
-        import struct
         _CMD = 25  # COMM_DETECT_MOTOR_R_L
-        self.serial_port.reset_input_buffer()
-        self.serial_port.write(frame(bytes([_CMD])))
-        buf = b''
-        t0 = time.monotonic()
-        while time.monotonic() - t0 < timeout:
-            time.sleep(0.1)
-            if self.serial_port.in_waiting:
-                buf += self.serial_port.read(self.serial_port.in_waiting)
-            payload, consumed = unframe(buf)
-            buf = buf[consumed:]
-            if payload and len(payload) >= 13 and payload[0] == _CMD:
-                r, l, ld_lq_diff = struct.unpack_from('!iii', payload, 1)
-                return r / 1e6, l / 1e3, ld_lq_diff / 1e3
-        raise TimeoutError(f"No response to COMM_DETECT_MOTOR_R_L after {timeout:.0f}s")
+        payload = self._dispatcher.request(frame(bytes([_CMD])), _CMD, timeout=timeout)
+        if len(payload) < 13:
+            raise TimeoutError(f"Malformed response to COMM_DETECT_MOTOR_R_L")
+        r, l, ld_lq_diff = struct.unpack_from('!iii', payload, 1)
+        return r / 1e6, l / 1e3, ld_lq_diff / 1e3
 
     def detect_motor_flux_linkage_openloop(self, current, erpm_per_sec, duty,
                                            resistance, inductance, timeout=60.0):
@@ -322,8 +303,6 @@ class VESC(object):
             resistance [Ω]    × 1e6
             inductance [H]    × 1e8  (optional field — always sent)
         """
-        from pyvesc.protocol.packet.codec import frame, unframe
-        import struct
         _CMD = 57  # COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP
         params = struct.pack('!iiiii',
             int(current      * 1e3),
@@ -332,23 +311,12 @@ class VESC(object):
             int(resistance   * 1e6),
             int(inductance   * 1e8),
         )
-        self.serial_port.reset_input_buffer()
-        self.serial_port.write(frame(bytes([_CMD]) + params))
-        buf = b''
-        t0 = time.monotonic()
-        while time.monotonic() - t0 < timeout:
-            time.sleep(0.1)
-            if self.serial_port.in_waiting:
-                buf += self.serial_port.read(self.serial_port.in_waiting)
-            payload, consumed = unframe(buf)
-            buf = buf[consumed:]
-            if payload and len(payload) >= 14 and payload[0] == _CMD:
-                linkage, enc_offset, enc_ratio = struct.unpack_from('!iii', payload, 1)
-                enc_inverted = bool(payload[13])
-                return linkage / 1e7, enc_offset / 1e6, enc_ratio / 1e6, enc_inverted
-        raise TimeoutError(
-            f"No response to COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP after {timeout:.0f}s"
-        )
+        payload = self._dispatcher.request(frame(bytes([_CMD]) + params), _CMD, timeout=timeout)
+        if len(payload) < 14:
+            raise TimeoutError(f"Malformed response to COMM_DETECT_MOTOR_FLUX_LINKAGE_OPENLOOP")
+        linkage, enc_offset, enc_ratio = struct.unpack_from('!iii', payload, 1)
+        enc_inverted = bool(payload[13])
+        return linkage / 1e7, enc_offset / 1e6, enc_ratio / 1e6, enc_inverted
 
     def detect_encoder(self, current, timeout=30.0):
         """Send COMM_DETECT_ENCODER and return (offset_deg, ratio, inverted).
@@ -360,25 +328,14 @@ class VESC(object):
         Request: current [A] × 1e3
         Response: offset [deg] × 1e6, ratio × 1e6, inverted (u8)
         """
-        from pyvesc.protocol.packet.codec import frame, unframe
-        import struct
         _CMD = 27  # COMM_DETECT_ENCODER
         params = struct.pack('!i', int(current * 1e3))
-        self.serial_port.reset_input_buffer()
-        self.serial_port.write(frame(bytes([_CMD]) + params))
-        buf = b''
-        t0 = time.monotonic()
-        while time.monotonic() - t0 < timeout:
-            time.sleep(0.1)
-            if self.serial_port.in_waiting:
-                buf += self.serial_port.read(self.serial_port.in_waiting)
-            payload, consumed = unframe(buf)
-            buf = buf[consumed:]
-            if payload and len(payload) >= 10 and payload[0] == _CMD:
-                offset, ratio = struct.unpack_from('!ii', payload, 1)
-                inverted = bool(payload[9])
-                return offset / 1e6, ratio / 1e6, inverted
-        raise TimeoutError(f"No response to COMM_DETECT_ENCODER after {timeout:.0f}s")
+        payload = self._dispatcher.request(frame(bytes([_CMD]) + params), _CMD, timeout=timeout)
+        if len(payload) < 10:
+            raise TimeoutError(f"Malformed response to COMM_DETECT_ENCODER")
+        offset, ratio = struct.unpack_from('!ii', payload, 1)
+        inverted = bool(payload[9])
+        return offset / 1e6, ratio / 1e6, inverted
 
     def get_mcconf_default_motor_params(self, timeout=5.0):
         """Send COMM_GET_MCCONF_DEFAULT and return (l_h, ld_lq_diff_h, r_ohm,
@@ -390,28 +347,17 @@ class VESC(object):
         are fixed by the field order in confgenerator.c and don't depend on
         field values, since every field type has a constant width.
         """
-        from pyvesc.protocol.packet.codec import frame, unframe
-        import struct
         _CMD = 15  # COMM_GET_MCCONF_DEFAULT
-        self.serial_port.reset_input_buffer()
-        self.serial_port.write(frame(bytes([_CMD])))
-        buf = b''
-        t0 = time.monotonic()
-        while time.monotonic() - t0 < timeout:
-            time.sleep(0.1)
-            if self.serial_port.in_waiting:
-                buf += self.serial_port.read(self.serial_port.in_waiting)
-            payload, consumed = unframe(buf)
-            buf = buf[consumed:]
-            if payload and len(payload) >= 174 and payload[0] == _CMD:
-                l_raw, ld_lq_raw, r_raw, flux_raw = struct.unpack_from('!IIII', payload, 158)
-                return (
-                    _decode_float32_auto(l_raw),
-                    _decode_float32_auto(ld_lq_raw),
-                    _decode_float32_auto(r_raw),
-                    _decode_float32_auto(flux_raw),
-                )
-        raise TimeoutError(f"No response to COMM_GET_MCCONF_DEFAULT after {timeout:.0f}s")
+        payload = self._dispatcher.request(frame(bytes([_CMD])), _CMD, timeout=timeout)
+        if len(payload) < 174:
+            raise TimeoutError(f"Malformed response to COMM_GET_MCCONF_DEFAULT")
+        l_raw, ld_lq_raw, r_raw, flux_raw = struct.unpack_from('!IIII', payload, 158)
+        return (
+            _decode_float32_auto(l_raw),
+            _decode_float32_auto(ld_lq_raw),
+            _decode_float32_auto(r_raw),
+            _decode_float32_auto(flux_raw),
+        )
 
     def erase_new_app(self, size, timeout=20.0):
         """Send COMM_ERASE_NEW_APP and wait for the erase-complete response.
@@ -423,22 +369,13 @@ class VESC(object):
         :param size: number of bytes to erase in the staging region.
         :return: True if the firmware reported success.
         """
-        from pyvesc.protocol.packet.codec import frame, unframe
-        import struct
         _CMD = 2  # COMM_ERASE_NEW_APP
-        self.serial_port.reset_input_buffer()
-        self.serial_port.write(frame(bytes([_CMD]) + struct.pack('!I', size)))
-        buf = b''
-        t0 = time.monotonic()
-        while time.monotonic() - t0 < timeout:
-            time.sleep(0.1)
-            if self.serial_port.in_waiting:
-                buf += self.serial_port.read(self.serial_port.in_waiting)
-            payload, consumed = unframe(buf)
-            buf = buf[consumed:]
-            if payload and len(payload) >= 2 and payload[0] == _CMD:
-                return bool(payload[1])
-        raise TimeoutError(f"No response to COMM_ERASE_NEW_APP after {timeout:.0f}s")
+        payload = self._dispatcher.request(
+            frame(bytes([_CMD]) + struct.pack('!I', size)), _CMD, timeout=timeout
+        )
+        if len(payload) < 2:
+            raise TimeoutError(f"Malformed response to COMM_ERASE_NEW_APP")
+        return bool(payload[1])
 
     def write_new_app_data(self, offset, data, timeout=3.0):
         """Send one COMM_WRITE_NEW_APP_DATA chunk and wait for its ack.
@@ -453,22 +390,13 @@ class VESC(object):
             384-byte chunks.
         :return: True if the firmware reported success for this chunk.
         """
-        from pyvesc.protocol.packet.codec import frame, unframe
-        import struct
         _CMD = 3  # COMM_WRITE_NEW_APP_DATA
-        self.serial_port.reset_input_buffer()
-        self.serial_port.write(frame(bytes([_CMD]) + struct.pack('!I', offset) + bytes(data)))
-        buf = b''
-        t0 = time.monotonic()
-        while time.monotonic() - t0 < timeout:
-            time.sleep(0.01)
-            if self.serial_port.in_waiting:
-                buf += self.serial_port.read(self.serial_port.in_waiting)
-            payload, consumed = unframe(buf)
-            buf = buf[consumed:]
-            if payload and len(payload) >= 2 and payload[0] == _CMD:
-                return bool(payload[1])
-        raise TimeoutError(f"No response to COMM_WRITE_NEW_APP_DATA after {timeout:.0f}s")
+        payload = self._dispatcher.request(
+            frame(bytes([_CMD]) + struct.pack('!I', offset) + bytes(data)), _CMD, timeout=timeout
+        )
+        if len(payload) < 2:
+            raise TimeoutError(f"Malformed response to COMM_WRITE_NEW_APP_DATA")
+        return bool(payload[1])
 
     def jump_to_bootloader(self):
         """Send COMM_JUMP_TO_BOOTLOADER.
@@ -480,9 +408,8 @@ class VESC(object):
         in a firmware update — call only once every chunk has been
         acknowledged successfully.
         """
-        from pyvesc.protocol.packet.codec import frame
         _CMD = 1  # COMM_JUMP_TO_BOOTLOADER
-        self.serial_port.write(frame(bytes([_CMD])))
+        self._dispatcher.send(frame(bytes([_CMD])))
 
     def set_rotor_position_mode(self, mode):
         """Set the firmware's periodic-thread position-report mode (COMM_SET_DETECT).
@@ -491,7 +418,7 @@ class VESC(object):
         broadcast raw encoder angle via unsolicited COMM_ROTOR_POSITION packets
         every 10ms. Use SetRotorPositionMode.DISP_POS_OFF to stop the broadcast.
         """
-        self.write(encode(SetRotorPositionMode(mode)))
+        self._dispatcher.send(encode(SetRotorPositionMode(mode)))
 
     def stream_rotor_positions(self, max_duration_s, poll_interval_s=0.05):
         """Yield (timestamp, angle_deg) for each COMM_ROTOR_POSITION packet
@@ -499,26 +426,32 @@ class VESC(object):
 
         Requires set_rotor_position_mode(DISP_POS_MODE_ENCODER) to have been
         called first; the caller is responsible for turning it back off
-        afterward. Draining happens every poll_interval_s, but since the
-        firmware broadcasts every 10ms regardless, multiple buffered packets
-        may be decoded per drain — no samples are skipped.
+        afterward. Samples are delivered as they arrive (via the dispatcher's
+        subscribe mechanism) rather than batched on a drain interval, so
+        nothing is skipped even under concurrent telemetry/other traffic.
         """
-        import struct
         _CMD = 22  # COMM_ROTOR_POSITION
-        buf = b''
-        t0 = time.monotonic()
-        while time.monotonic() - t0 < max_duration_s:
-            time.sleep(poll_interval_s)
-            if self.serial_port.in_waiting:
-                buf += self.serial_port.read(self.serial_port.in_waiting)
+        q = queue.Queue()
+
+        def on_rotor_position(payload):
+            if len(payload) >= 5:
+                angle = struct.unpack_from('!i', payload, 1)[0] / 100000.0
+                q.put((time.monotonic(), angle))
+
+        unsubscribe = self._dispatcher.subscribe(_CMD, on_rotor_position)
+        try:
+            deadline = time.monotonic() + max_duration_s
+            wait_slice = poll_interval_s if poll_interval_s > 0 else 0.05
             while True:
-                payload, consumed = unframe(buf)
-                if consumed == 0:
-                    break
-                buf = buf[consumed:]
-                if payload and len(payload) >= 5 and payload[0] == _CMD:
-                    angle = struct.unpack_from('!i', payload, 1)[0] / 100000.0
-                    yield time.monotonic(), angle
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return
+                try:
+                    yield q.get(timeout=min(remaining, wait_slice))
+                except queue.Empty:
+                    continue
+        finally:
+            unsubscribe()
 
     def get_rpm(self):
         """
@@ -549,7 +482,3 @@ class VESC(object):
         :return: Current incoming current
         """
         return self.get_measurements().current_in
-
-
-
-
