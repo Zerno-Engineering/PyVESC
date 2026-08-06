@@ -28,7 +28,7 @@ class SerialDispatcher:
         self._write_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._buf = bytearray()
-        self._waiters = {}       # comm_id -> queue.Queue (at most one outstanding request per comm_id)
+        self._waiters = {}       # comm_id -> list[queue.Queue], one per outstanding request() call
         self._subscribers = {}   # comm_id -> list[callable]
         self._stop = threading.Event()
         self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
@@ -66,11 +66,11 @@ class SerialDispatcher:
     def _dispatch(self, payload):
         comm_id = payload[0]
         with self._state_lock:
-            waiter = self._waiters.get(comm_id)
+            waiters = list(self._waiters.get(comm_id, ()))
             subs = list(self._subscribers.get(comm_id, ()))
-        if waiter is not None:
+        for q in waiters:
             try:
-                waiter.put_nowait(payload)
+                q.put_nowait(payload)
             except queue.Full:
                 pass
         for callback in subs:
@@ -85,17 +85,17 @@ class SerialDispatcher:
         """Send a packet and block for the next payload matching comm_id.
 
         Raises TimeoutError if no matching payload arrives within timeout.
-        Only one request per comm_id may be outstanding at a time — this
-        holds for every caller in this app (telemetry is the sole periodic
-        COMM_GET_VALUES requester; tests run sequentially).
+        Multiple request() calls for the same comm_id may be outstanding at
+        once (e.g. telemetry polling GET_VALUES while a test also polls it
+        directly) — each registers its own queue, and every incoming payload
+        for that comm_id is broadcast to all of them. That's safe because
+        VESC replies aren't correlated to a specific request via any
+        sequence ID: a GET_VALUES reply is just "current sensor state",
+        interchangeable regardless of which concurrent request triggered it.
         """
         q = queue.Queue(maxsize=1)
         with self._state_lock:
-            if comm_id in self._waiters:
-                raise RuntimeError(
-                    f"A request for comm_id {comm_id} is already outstanding"
-                )
-            self._waiters[comm_id] = q
+            self._waiters.setdefault(comm_id, []).append(q)
         try:
             self.send(data)
             try:
@@ -104,8 +104,11 @@ class SerialDispatcher:
                 raise TimeoutError(f"No response for comm_id {comm_id} after {timeout:.1f}s")
         finally:
             with self._state_lock:
-                if self._waiters.get(comm_id) is q:
-                    del self._waiters[comm_id]
+                waiters = self._waiters.get(comm_id)
+                if waiters is not None and q in waiters:
+                    waiters.remove(q)
+                    if not waiters:
+                        del self._waiters[comm_id]
 
     def subscribe(self, comm_id: int, callback):
         """Register callback(payload) for every future payload matching comm_id.
