@@ -288,6 +288,21 @@ class VESC(object):
 
         return uuid_bytes.hex().upper()
 
+    def ping_can(self, timeout=5.0):
+        """Send COMM_PING_CAN and return the list of CAN ids that responded.
+
+        Used to discover a VESC reachable only over CAN through a bridge
+        (e.g. a VESC Express gateway) rather than directly on this
+        connection — the bridge itself sweeps all 255 possible ids on its
+        CAN bus and reports back which ones are actually present. That
+        sweep consistently takes ~2.5s on real hardware regardless of this
+        connection's own read timeout, so the default here is independent
+        of it and generous enough to leave real margin.
+        """
+        _CMD = 62  # COMM_PING_CAN
+        payload = self._dispatcher.request(frame(bytes([_CMD])), _CMD, timeout=timeout)
+        return list(payload[1:])
+
     def detect_motor_rl(self, timeout=30.0):
         """Send COMM_DETECT_MOTOR_R_L and return (r_ohm, l_henry, ld_lq_diff_henry).
 

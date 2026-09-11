@@ -2,12 +2,14 @@ import queue
 import threading
 import time
 
-from pyvesc.protocol.packet.codec import unframe
+from pyvesc.protocol.packet.codec import frame, unframe
 
 try:
     import serial
 except ImportError:
     serial = None
+
+_COMM_FORWARD_CAN = 34  # matches VESC firmware's datatypes.h COMM_PACKET_ID enum
 
 
 class SerialDispatcher:
@@ -31,8 +33,25 @@ class SerialDispatcher:
         self._waiters = {}       # comm_id -> list[queue.Queue], one per outstanding request() call
         self._subscribers = {}   # comm_id -> list[callable]
         self._stop = threading.Event()
+        self._can_forward_target = None  # CAN id, or None to send straight to whatever's on the wire
         self._reader_thread = threading.Thread(target=self._reader_loop, daemon=True)
         self._reader_thread.start()
+
+    def set_can_forward_target(self, can_id) -> None:
+        """Transparently wrap every future send()/request() in COMM_FORWARD_CAN,
+        for talking to a VESC reachable only over CAN through a bridge (e.g. a
+        VESC Express gateway) instead of directly over this serial connection.
+
+        Pass None to disable wrapping and go back to sending directly — the
+        default, and the only behavior when talking to a VESC connected
+        straight to this port; existing direct-USB callers are completely
+        unaffected since they never touch this setting.
+
+        The reply side needs no matching unwrap: the bridge relays the
+        target's raw, already-unwrapped reply back over this same
+        connection, so it decodes exactly like a direct reply would.
+        """
+        self._can_forward_target = can_id
 
     def _reader_loop(self):
         while not self._stop.is_set():
@@ -78,8 +97,19 @@ class SerialDispatcher:
 
     def send(self, data: bytes) -> None:
         """Write a fire-and-forget packet (no reply expected)."""
+        if self._can_forward_target is not None:
+            data = self._wrap_for_can_forward(data)
         with self._write_lock:
             self._serial.write(data)
+
+    def _wrap_for_can_forward(self, data: bytes) -> bytes:
+        payload, consumed = unframe(data)
+        if not payload or consumed != len(data):
+            # Not a single, complete, well-formed frame -- send as-is rather
+            # than risk mangling something this wasn't meant to handle; every
+            # real caller here always passes exactly one frame() result.
+            return data
+        return frame(bytes([_COMM_FORWARD_CAN, self._can_forward_target]) + payload)
 
     def request(self, data: bytes, comm_id: int, timeout: float) -> bytes:
         """Send a packet and block for the next payload matching comm_id.
